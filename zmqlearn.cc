@@ -1,7 +1,9 @@
 #include "3rdparty/zmq.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
@@ -50,7 +52,9 @@ void server() {
   zmq::socket_t pub_socket(context, ZMQ_PUB);
   pub_socket.bind(kIPCEndpointPrefix + "_pub");
   zmq::socket_t pull_socket(context, ZMQ_PULL);
+  pull_socket.set(zmq::sockopt::rcvhwm, 1000000); // 感觉设大点挺好的，防止阻塞
   pull_socket.bind(kIPCEndpointPrefix + "_pull");
+  FILE *fp = fopen("/tmp/cyxtestserver", "w");
 
   // 3. 发起 workload
   vector<int> resource(kArraySize, 0);
@@ -67,18 +71,19 @@ void server() {
       break;
     }
 
-    // 使用原来就有的对象构建 message，属于零拷贝
     // zmq 的 send 是“异步”的。为了保障数据始终有效，最好等到
     Request request;
     request.req_id_ = ++req_id;
     request.which_ = rand() % kArraySize;
     request.user_data_ = rand();
-
+    fprintf(fp, "req_id = %d, which = %d, user_data = %d\n", request.req_id_,
+            request.which_, request.user_data_);
     resource[request.which_] += mpi_size - 1; // 模拟负载的引用计数
 
     for (auto &req_socket : req_sockets) {
-      zmq::message_t request_msg(&request, sizeof(Request), nullptr, nullptr);
-      auto send_res = req_socket.send(request_msg, zmq::send_flags::none);
+      // 也许我们压根就不需要 zmq::message_t，直接用 buffer 就行
+      auto send_res = req_socket.send(
+          zmq::const_buffer(&request, sizeof(Request)), zmq::send_flags::none);
       if (send_res != sizeof(Request)) {
         printf("send failed\n");
         exit(-1);
@@ -100,11 +105,18 @@ void server() {
 
     // std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-    zmq::message_t pull_msg;
+    int which;
     do {
-      if (pull_socket.recv(pull_msg, zmq::recv_flags::dontwait)) {
-        int *which_ptr = pull_msg.data<int>();
-        resource[*which_ptr]--;
+      // 也许我们压根就不需要 zmq::message_t，直接用 buffer 就行
+      auto pull_res = pull_socket.recv(zmq::mutable_buffer(&which, sizeof(int)),
+                                       zmq::recv_flags::dontwait);
+      if (pull_res.has_value()) {
+        if (pull_res->size != sizeof(int)) {
+          printf("pull size error\n");
+          exit(-1);
+        }
+        resource[which]--;
+        fprintf(fp, "pull which = %d\n", which);
         pull_received++;
       } else {
         break;
@@ -112,24 +124,38 @@ void server() {
     } while (true);
   }
 
-  zmq::message_t pull_msg;
+  int which;
   while (pull_received < req_sent) {
-    auto pull_res = pull_socket.recv(pull_msg, zmq::recv_flags::none);
+    // 也许我们压根就不需要 zmq::message_t，直接用 buffer 就行
+    auto pull_res = pull_socket.recv(zmq::mutable_buffer(&which, sizeof(int)),
+                                     zmq::recv_flags::none);
     if (!pull_res.has_value()) {
-      printf("recv failed\n");
+      printf("pull failed\n");
       exit(-1);
     }
-    int *which_ptr = pull_msg.data<int>();
-    resource[*which_ptr]--;
+    if (pull_res->size != sizeof(int)) {
+      printf("pull size error\n");
+      exit(-1);
+    }
+    resource[which]--;
+    fprintf(fp, "pull which = %d\n", which);
     pull_received++;
   }
 
+  fclose(fp);
   for (auto &req_socket : req_sockets) {
     req_socket.close();
   }
   pull_socket.close();
   pub_socket.close();
   context.close();
+
+  for (const auto &x : resource) {
+    if (x != 0) {
+      printf("resource leak\n");
+      exit(-1);
+    }
+  }
 
   std::cout << "Server Stats: REQ Sent = " << req_sent
             << ", REP Received = " << rep_received
@@ -140,6 +166,7 @@ void client() {
   zmq::context_t context(1);
   zmq::socket_t rep_socket(context, ZMQ_REP);
   zmq::socket_t push_socket(context, ZMQ_PUSH);
+  push_socket.set(zmq::sockopt::sndhwm, 1000000); // 感觉设大点挺好的，防止阻塞
   zmq::socket_t sub_socket(context, ZMQ_SUB);
 
   rep_socket.connect(kIPCEndpointPrefix + "_req_" + std::to_string(mpi_rank));
@@ -147,12 +174,13 @@ void client() {
   sub_socket.connect(kIPCEndpointPrefix + "_pub");
   sub_socket.set(zmq::sockopt::subscribe, "");
 
+  FILE *fp = fopen(
+      (string("/tmp/cyxtestclient") + std::to_string(mpi_rank)).c_str(), "w");
+
   int rep_sent = 0;
   int push_sent = 0;
 
   Request request;
-  zmq::message_t request_msg(&request, sizeof(Request), nullptr, nullptr);
-
   while (true) {
     // 在学习代码中，这么写可以，反正 client 没有其他事情干
     // 在 OnionCache 中，这么写感觉没有必要，反正每个都要检查，还不如直接
@@ -174,13 +202,18 @@ void client() {
     }
 
     if (items[0].revents & ZMQ_POLLIN) {
-      auto recv_res = rep_socket.recv(request_msg, zmq::recv_flags::none);
-      if (!recv_res.has_value()) {
+      // 也许我们压根就不需要 zmq::message_t，直接用 buffer 就行
+      auto recv_res =
+          rep_socket.recv(zmq::mutable_buffer(&request, sizeof(Request)),
+                          zmq::recv_flags::none);
+      if (!recv_res.has_value() || recv_res->size != sizeof(Request)) {
         printf("recv failed\n");
         exit(-1);
       }
 
       // std::this_thread::sleep_for(std::chrono::milliseconds(3));
+      fprintf(fp, "req_id = %d, which = %d, user_data = %d\n", request.req_id_,
+              request.which_, request.user_data_);
 
       // 这玩意的 data 之前是零拷贝指定给 msg 的，所以这里可以直接用
       int which = request.which_;
@@ -189,12 +222,15 @@ void client() {
                       zmq::send_flags::none); // 空消息
       rep_sent++;
 
-      push_socket.send(zmq::message_t(&which, sizeof(int)), // 有拷贝
-                       zmq::send_flags::none);
+      push_socket.send(
+          zmq::message_t(&which, sizeof(int)), // 有拷贝，因为我们无法保证 which
+                                               // 在 push 完成前始终有效
+          zmq::send_flags::none);
       push_sent++;
     }
   }
 
+  fclose(fp);
   rep_socket.close();
   push_socket.close();
   sub_socket.close();
@@ -208,6 +244,7 @@ void client() {
 // export LD_LIBRARY_PATH=/usr/local/lib64:$LD_LIBRARY_PATH
 // mpirun -x LD_LIBRARY_PATH -np 4 ./build/zmqlearn
 int main(int argc, char **argv) {
+  srand(time(nullptr));
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
